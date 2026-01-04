@@ -1,8 +1,8 @@
 require("dotenv").config();
-const bs58 = require("bs58");
-const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
+const bs58 = require("bs58");
+const axios = require("axios");
 const {
   Connection,
   PublicKey,
@@ -24,7 +24,7 @@ const DISCORD_WEBHOOK_URL = mustEnv("DISCORD_WEBHOOK_URL");
 
 const DISCORD_PING = String(process.env.DISCORD_PING || "").trim();
 
-const POLL_SECONDS = Number(process.env.POLL_SECONDS || "15");
+const POLL_SECONDS = Number(process.env.POLL_SECONDS || "10");
 const MIN_SOL = Number(process.env.MIN_SOL || "0.1");
 const MAX_SOL = Number(process.env.MAX_SOL || "20");
 const WINDOW_OUTFLOWS = Number(process.env.WINDOW_OUTFLOWS || "10");
@@ -37,10 +37,8 @@ const STATE_FILE = path.join(__dirname, "state.json");
 // ================== STATE ==================
 let state = {
   anchorSig: null,
-  outflows: [],
+  outflows: [],      // [{signature, outLamports, outflowSol4, ts}]
   lastAlertKey: null,
-  // dedupe destination wallets (global): wallet => true
-  destWritten: {},
 };
 
 function loadState() {
@@ -51,7 +49,6 @@ function loadState() {
     }
   } catch {}
   if (!Array.isArray(state.outflows)) state.outflows = [];
-  if (!state.destWritten || typeof state.destWritten !== "object") state.destWritten = {};
 }
 function saveState() {
   try {
@@ -60,21 +57,6 @@ function saveState() {
 }
 
 // ================== HELPERS ==================
-function formatSol(sol) {
-  let s = sol.toFixed(4);
-  s = s.replace(/\.?0+$/, "");
-  return s;
-}
-function countDigits(str) {
-  const m = str.match(/\d/g);
-  return m ? m.length : 0;
-}
-function isFiveDigitsAmount(sol) {
-  return countDigits(formatSol(sol)) === 5;
-}
-function makeAlertKey(outflows) {
-  return outflows.map((x) => x.signature).join("|");
-}
 function solscanTxUrl(sig) {
   return `https://solscan.io/tx/${sig}`;
 }
@@ -82,29 +64,58 @@ function solscanAccountUrl(addr) {
   return `https://solscan.io/account/${addr}`;
 }
 
-// ================== DISCORD NOTIFY (FORMAT AS YOU WANT) ==================
+// Format SOL to 4 decimals (CUT DOWN) using lamports (no float issues)
+function lamportsToSol4String(lamports) {
+  // lamports -> scaled 4 decimals: floor(lamports / 1e5)
+  const scaled = Math.floor(Math.abs(lamports) / 100000); // integer
+  const intPart = Math.floor(scaled / 10000);
+  const fracPart = scaled % 10000;
+  return `${intPart}.${String(fracPart).padStart(4, "0")}`;
+}
+
+// Digits rule "chuẩn của ông":
+// - Lấy amount ở 4 decimals (CUT DOWN) -> scaled = floor(lamports/1e5)
+// - Bỏ dấu '.' => digits = string(scaled) nhưng với <1 SOL phải tính cả số 0 đầu: padStart(5,'0')
+// => 5 digits nghĩa là scaled <= 99999 (tức <= 9.9999 SOL) vì ông tính cả số 0 đầu cho <1.
+function isFiveDigitsLamports_4dpCut(lamports) {
+  const scaled = Math.floor(Math.abs(lamports) / 100000); // SOL * 10000 (cut)
+  if (scaled < 0) return false;
+  // 5 digits tính theo ví dụ: 0.1234 => scaled=1234 => "01234"
+  // => chấp nhận scaled từ 0..99999
+  return scaled <= 99999;
+}
+
+// Range check using true SOL amount from lamports (not display)
+function inSolRange(lamports) {
+  const sol = Math.abs(lamports) / LAMPORTS_PER_SOL;
+  return sol >= MIN_SOL && sol <= MAX_SOL;
+}
+
+function makeAlertKey(outflows) {
+  return outflows.map((x) => x.signature).join("|");
+}
+
+// ================== DISCORD NOTIFY (FORMAT YOUR STYLE) ==================
 async function sendDiscordText({
   watch,
-  matchedLines,          // array of {amountSol, destWallet}
-  destPreview,           // array of wallets
+  matchedLines,   // [{sol4, destWallet}]
+  destPreview,    // [wallets]
   windowSize,
-  inRange,
-  fiveDigits,
+  inRangeCount,
+  fiveDigitsCount,
 }) {
   const lines = [];
 
   lines.push("🚨 SOL Outflow Pattern Trigger");
 
-  // numbered list
   if (matchedLines.length === 0) {
     lines.push("None");
   } else {
     matchedLines.forEach((x, i) => {
-      lines.push(`${i + 1}) ${formatSol(x.amountSol)} SOL — ${x.destWallet}`);
+      lines.push(`${i + 1}) ${x.sol4} SOL — ${x.destWallet}`);
     });
   }
 
-  lines.push(""); // blank line
   lines.push("Source (watch)");
   lines.push(watch);
   lines.push(solscanAccountUrl(watch));
@@ -117,10 +128,10 @@ async function sendDiscordText({
   lines.push(String(windowSize));
 
   lines.push("In range");
-  lines.push(String(inRange));
+  lines.push(String(inRangeCount));
 
   lines.push("Five-digits");
-  lines.push(String(fiveDigits));
+  lines.push(String(fiveDigitsCount));
 
   lines.push("Range (SOL)");
   lines.push(`${MIN_SOL} → ${MAX_SOL}`);
@@ -145,7 +156,7 @@ async function sendDiscordText({
   );
 }
 
-// ================== TX PARSE (SYSTEM TRANSFER OUT + DEST) ==================
+// ================== TX PARSE (SYSTEM TRANSFER OUT) ==================
 function pubkeyToString(k) {
   if (!k) return "";
   if (typeof k === "string") return k;
@@ -186,17 +197,18 @@ function decodeIxDataToBuffer(dataStr) {
   return null;
 }
 
-// Return transfersOut = [{to, lamports}]
-function decodeSystemTransfersOut(tx, watchBase58) {
+// Returns: { lamportsOut, transfersOut: [{to, lamports}] }
+function decodeSystemTransfersOutWithSum(tx, watchBase58) {
   const msg = tx?.transaction?.message;
   const meta = tx?.meta;
-  if (!msg || !meta) return [];
+  if (!msg || !meta) return { lamportsOut: 0, transfersOut: [] };
 
   const keys = getAllAccountKeysFromTx(tx);
   const outer = msg.instructions || [];
   const inner = meta.innerInstructions || [];
 
-  const out = [];
+  let lamportsOut = 0;
+  const transfersOut = [];
 
   function handleCompiledIx(ix) {
     try {
@@ -221,7 +233,11 @@ function decodeSystemTransfersOut(tx, watchBase58) {
       const tr = SystemInstruction.decodeTransfer(txIxLike);
       const from = tr.fromPubkey.toBase58();
       const to = tr.toPubkey.toBase58();
-      if (from === watchBase58) out.push({ to, lamports: tr.lamports });
+
+      if (from === watchBase58) {
+        lamportsOut += tr.lamports;
+        transfersOut.push({ to, lamports: tr.lamports });
+      }
     } catch {}
   }
 
@@ -230,34 +246,26 @@ function decodeSystemTransfersOut(tx, watchBase58) {
     for (const ix of innerItem.instructions || []) handleCompiledIx(ix);
   }
 
-  return out;
+  return { lamportsOut, transfersOut };
 }
 
-function getOutflowSolFromTx(tx, watchBase58) {
-  if (!tx?.meta) return null;
+// Fallback: net delta (includes fee), only used when cannot decode transfers out
+function getNetOutLamportsFallback(tx, watchBase58) {
+  const meta = tx?.meta;
+  if (!meta) return 0;
 
-  // Prefer decode transfers out
-  const transfers = decodeSystemTransfersOut(tx, watchBase58);
-  if (transfers.length > 0) {
-    const lamportsOut = transfers.reduce((a, b) => a + (b.lamports || 0), 0);
-    return lamportsOut / LAMPORTS_PER_SOL;
-  }
-
-  // fallback net delta
   const keys = getAllAccountKeysFromTx(tx);
   const idx = keys.findIndex((k) => k === watchBase58);
-  if (idx === -1) return null;
+  if (idx === -1) return 0;
 
-  const pre = tx.meta.preBalances?.[idx];
-  const post = tx.meta.postBalances?.[idx];
-  if (typeof pre !== "number" || typeof post !== "number") return null;
+  const pre = meta.preBalances?.[idx];
+  const post = meta.postBalances?.[idx];
+  if (typeof pre !== "number" || typeof post !== "number") return 0;
 
-  const deltaLamports = post - pre;
-  if (deltaLamports >= 0) return null;
+  const delta = post - pre; // negative if out
+  if (delta >= 0) return 0;
 
-  const outflowSol = (-deltaLamports) / LAMPORTS_PER_SOL;
-  if (outflowSol < 0.00005) return null;
-  return outflowSol;
+  return -delta;
 }
 
 // ================== NEW-ONLY SIGNATURES ==================
@@ -267,7 +275,11 @@ async function fetchNewestSignature(conn, watchPk) {
 }
 
 async function fetchNewSignatures(conn, watchPk, anchorSig) {
-  const sigs = await conn.getSignaturesForAddress(watchPk, { limit: SIG_FETCH_LIMIT }, "confirmed");
+  const sigs = await conn.getSignaturesForAddress(
+    watchPk,
+    { limit: SIG_FETCH_LIMIT },
+    "confirmed"
+  );
   if (!sigs.length) return [];
   if (!anchorSig) return [];
 
@@ -287,7 +299,7 @@ async function main() {
   const watchPk = new PublicKey(WATCH_ADDRESS);
   const watch = watchPk.toBase58();
 
-  console.log("✅ Outflow watcher (Discord text format, no attachments)");
+  console.log("✅ Outflow watcher (5-digits = 4dp CUT, count digits incl leading 0 for <1)");
   console.log("WATCH:", watch);
   console.log(`Config: window=${WINDOW_OUTFLOWS}, required=${REQUIRED_MATCH}, range=[${MIN_SOL}, ${MAX_SOL}] SOL, poll=${POLL_SECONDS}s`);
 
@@ -312,17 +324,31 @@ async function main() {
       if (newSigs.length > 0) {
         state.anchorSig = newSigs[0];
 
-        const ordered = [...newSigs].reverse();
+        const ordered = [...newSigs].reverse(); // older -> newer
         for (const sig of ordered) {
           const tx = await conn.getTransaction(sig, {
             commitment: "confirmed",
             maxSupportedTransactionVersion: 0,
           });
 
-          const outSol = getOutflowSolFromTx(tx, watch);
-          if (outSol === null) continue;
+          // decode transfer-out sum first
+          const { lamportsOut } = decodeSystemTransfersOutWithSum(tx, watch);
+          let outLamports = lamportsOut;
 
-          state.outflows.unshift({ signature: sig, outflowSol: outSol, ts: Date.now() });
+          // fallback when can't decode
+          if (!outLamports || outLamports <= 0) {
+            outLamports = getNetOutLamportsFallback(tx, watch);
+          }
+          if (!outLamports || outLamports <= 0) continue; // not outflow
+
+          const sol4 = lamportsToSol4String(outLamports);
+
+          state.outflows.unshift({
+            signature: sig,
+            outLamports: outLamports,
+            outflowSol4: sol4,
+            ts: Date.now(),
+          });
           addedOutflows++;
 
           if (state.outflows.length > WINDOW_OUTFLOWS) {
@@ -331,28 +357,30 @@ async function main() {
         }
 
         saveState();
-        if (addedOutflows > 0) console.log(`🆕 NewSigs=${newSigs.length} | AddedOutflows=${addedOutflows}`);
+        if (addedOutflows > 0) {
+          console.log(`🆕 NewSigs=${newSigs.length} | AddedOutflows=${addedOutflows}`);
+          const last = state.outflows[0];
+          if (last) console.log(`   ↳ latest outflow: ${last.outflowSol4} SOL | ${last.signature}`);
+        }
       }
 
       // Evaluate
       if (state.outflows.length >= WINDOW_OUTFLOWS) {
-        const considered = state.outflows.filter((x) => x.outflowSol >= MIN_SOL && x.outflowSol <= MAX_SOL);
-        const matches = considered.filter((x) => isFiveDigitsAmount(x.outflowSol));
+        const considered = state.outflows.filter((x) => inSolRange(x.outLamports));
+        const matches = considered.filter((x) => isFiveDigitsLamports_4dpCut(x.outLamports));
 
-        const inRange = considered.length;
-        const fiveDigits = matches.length;
+        const inRangeCount = considered.length;
+        const fiveDigitsCount = matches.length;
 
-        console.log(`🧾 OutflowsWindow=${state.outflows.length} | InRange=${inRange} | FiveDigits=${fiveDigits}`);
+        console.log(`🧾 OutflowsWindow=${state.outflows.length} | InRange=${inRangeCount} | FiveDigits=${fiveDigitsCount}`);
 
-        if (fiveDigits >= REQUIRED_MATCH) {
+        if (fiveDigitsCount >= REQUIRED_MATCH) {
           const alertKey = makeAlertKey(state.outflows);
-          if (state.lastAlertKey === alertKey) {
-            // already sent
-          } else {
+          if (state.lastAlertKey !== alertKey) {
             state.lastAlertKey = alertKey;
             saveState();
 
-            // Build matched destination wallets from matched tx
+            // Build matchedLines: show DEST wallets from transfers in matched tx
             const matchedLines = [];
             const destSet = new Set();
 
@@ -362,42 +390,44 @@ async function main() {
                 maxSupportedTransactionVersion: 0,
               });
 
-              const outs = decodeSystemTransfersOut(tx, watch);
-              for (const t of outs) {
-                const sol = t.lamports / LAMPORTS_PER_SOL;
+              const { transfersOut } = decodeSystemTransfersOutWithSum(tx, watch);
 
-                // Only include amounts that match the SAME rule (range + 5 digits)
-                if (sol >= MIN_SOL && sol <= MAX_SOL && isFiveDigitsAmount(sol)) {
-                  matchedLines.push({ amountSol: sol, destWallet: t.to });
-                  destSet.add(t.to);
-                }
+              // For each transfer out: apply SAME rule on that transfer amount (range + 5digits)
+              for (const t of transfersOut) {
+                if (!inSolRange(t.lamports)) continue;
+                if (!isFiveDigitsLamports_4dpCut(t.lamports)) continue;
+
+                const sol4 = lamportsToSol4String(t.lamports);
+                matchedLines.push({ sol4, destWallet: t.to });
+                destSet.add(t.to);
               }
             }
 
             const destPreview = [...destSet].slice(0, PREVIEW_DEST_LIMIT);
 
-            // send text notify
             try {
               await sendDiscordText({
                 watch,
                 matchedLines,
                 destPreview,
                 windowSize: state.outflows.length,
-                inRange,
-                fiveDigits,
+                inRangeCount,
+                fiveDigitsCount,
               });
               console.log("✅ Sent Discord notify.");
             } catch (e) {
               console.error("❌ Discord webhook failed:", e?.message || e);
             }
 
-            // reset window + reset anchor so only tx after trigger is processed
+            // reset window + reset anchor (new-only since trigger)
             state.outflows = [];
             state.lastAlertKey = null;
             state.anchorSig = await fetchNewestSignature(conn, watchPk);
             saveState();
 
             console.log("🧼 Reset window & moved anchor after trigger.");
+          } else {
+            console.log("🔁 Trigger already sent for this window.");
           }
         }
       } else {
