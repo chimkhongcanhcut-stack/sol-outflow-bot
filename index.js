@@ -37,7 +37,7 @@ const STATE_FILE = path.join(__dirname, "state.json");
 // ================== STATE ==================
 let state = {
   anchorSig: null,
-  outflows: [],      // [{signature, outLamports, outflowSol4, ts}]
+  outflows: [], // [{signature, outLamports, outflowSol4, ts}]
   lastAlertKey: null,
 };
 
@@ -64,29 +64,22 @@ function solscanAccountUrl(addr) {
   return `https://solscan.io/account/${addr}`;
 }
 
-// Format SOL to 4 decimals (CUT DOWN) using lamports (no float issues)
+// SOL 4dp CUT (like solscan display in your examples)
 function lamportsToSol4String(lamports) {
-  // lamports -> scaled 4 decimals: floor(lamports / 1e5)
-  const scaled = Math.floor(Math.abs(lamports) / 100000); // integer
+  const scaled = Math.floor(Math.abs(lamports) / 100000); // floor(lamports / 1e5)
   const intPart = Math.floor(scaled / 10000);
   const fracPart = scaled % 10000;
   return `${intPart}.${String(fracPart).padStart(4, "0")}`;
 }
 
-// Digits rule "chuẩn của ông":
-// - Lấy amount ở 4 decimals (CUT DOWN) -> scaled = floor(lamports/1e5)
-// - Bỏ dấu '.' => digits = string(scaled) nhưng với <1 SOL phải tính cả số 0 đầu: padStart(5,'0')
-// => 5 digits nghĩa là scaled <= 99999 (tức <= 9.9999 SOL) vì ông tính cả số 0 đầu cho <1.
+// 5 digits rule "chuẩn theo ông": based on 4dp CUT, count digits after removing dot
+// => scaled = floor(lamports/1e5). For <1, leading 0 counts => accept scaled<=99999
 function isFiveDigitsLamports_4dpCut(lamports) {
-  const scaled = Math.floor(Math.abs(lamports) / 100000); // SOL * 10000 (cut)
-  if (scaled < 0) return false;
-  // 5 digits tính theo ví dụ: 0.1234 => scaled=1234 => "01234"
-  // => chấp nhận scaled từ 0..99999
-  return scaled <= 99999;
+  const scaled = Math.floor(Math.abs(lamports) / 100000); // SOL*10000 (cut)
+  return scaled <= 99999; // 0.1234 => 01234, 1.8692 => 18692, etc.
 }
 
-// Range check using true SOL amount from lamports (not display)
-function inSolRange(lamports) {
+function inSolRangeLamports(lamports) {
   const sol = Math.abs(lamports) / LAMPORTS_PER_SOL;
   return sol >= MIN_SOL && sol <= MAX_SOL;
 }
@@ -95,7 +88,7 @@ function makeAlertKey(outflows) {
   return outflows.map((x) => x.signature).join("|");
 }
 
-// ================== DISCORD NOTIFY (FORMAT YOUR STYLE) ==================
+// ================== DISCORD NOTIFY (YOUR FORMAT) ==================
 async function sendDiscordText({
   watch,
   matchedLines,   // [{sol4, destWallet}]
@@ -156,7 +149,48 @@ async function sendDiscordText({
   );
 }
 
-// ================== TX PARSE (SYSTEM TRANSFER OUT) ==================
+// ================== TX PARSE ==================
+// 1) Reliable: parsed transaction -> get system transfers (outer + inner)
+function extractTransfersFromParsed(parsedTx, watchBase58) {
+  const out = [];
+
+  function handleParsedIx(ix) {
+    if (!ix) return;
+    // parsed format: { program: 'system', parsed: { type: 'transfer', info: {...}}}
+    const prog = ix.program || ix.programId;
+    const parsed = ix.parsed;
+    if (!parsed || prog !== "system") return;
+
+    const info = parsed.info || {};
+    const type = parsed.type || "";
+    // support transfer + transferWithSeed
+    const source = info.source || info.from || info.authority || info.funder;
+    const dest = info.destination || info.to;
+
+    if (!source || !dest) return;
+    if (source !== watchBase58) return;
+
+    // lamports can be string
+    const lamports = Number(info.lamports || 0);
+    if (!Number.isFinite(lamports) || lamports <= 0) return;
+
+    out.push({ to: dest, lamports, _type: type });
+  }
+
+  // outer
+  const outer = parsedTx?.transaction?.message?.instructions || [];
+  for (const ix of outer) handleParsedIx(ix);
+
+  // inner
+  const inner = parsedTx?.meta?.innerInstructions || [];
+  for (const innerItem of inner) {
+    for (const ix of innerItem.instructions || []) handleParsedIx(ix);
+  }
+
+  return out;
+}
+
+// 2) Fallback: compiled decode (in case parsed not available)
 function pubkeyToString(k) {
   if (!k) return "";
   if (typeof k === "string") return k;
@@ -182,22 +216,16 @@ function getAllAccountKeysFromTx(tx) {
 
 function decodeIxDataToBuffer(dataStr) {
   if (!dataStr) return null;
-
-  // try base64
   try {
     const b64 = Buffer.from(dataStr, "base64");
     if (b64.length > 0) return b64;
   } catch {}
-
-  // fallback base58
   try {
     return Buffer.from(bs58.decode(dataStr));
   } catch {}
-
   return null;
 }
 
-// Returns: { lamportsOut, transfersOut: [{to, lamports}] }
 function decodeSystemTransfersOutWithSum(tx, watchBase58) {
   const msg = tx?.transaction?.message;
   const meta = tx?.meta;
@@ -224,19 +252,26 @@ function decodeSystemTransfersOutWithSum(tx, watchBase58) {
         isWritable: true,
       }));
 
-      const txIxLike = {
-        programId: SystemProgram.programId,
-        keys: metas,
-        data: dataBuf,
-      };
+      const txIxLike = { programId: SystemProgram.programId, keys: metas, data: dataBuf };
 
-      const tr = SystemInstruction.decodeTransfer(txIxLike);
-      const from = tr.fromPubkey.toBase58();
-      const to = tr.toPubkey.toBase58();
-
-      if (from === watchBase58) {
-        lamportsOut += tr.lamports;
-        transfersOut.push({ to, lamports: tr.lamports });
+      // detect type
+      const t = SystemInstruction.decodeInstructionType(txIxLike);
+      if (t === "Transfer") {
+        const tr = SystemInstruction.decodeTransfer(txIxLike);
+        const from = tr.fromPubkey.toBase58();
+        const to = tr.toPubkey.toBase58();
+        if (from === watchBase58) {
+          lamportsOut += tr.lamports;
+          transfersOut.push({ to, lamports: tr.lamports });
+        }
+      } else if (t === "TransferWithSeed") {
+        const tr = SystemInstruction.decodeTransferWithSeed(txIxLike);
+        const from = tr.fromPubkey.toBase58();
+        const to = tr.toPubkey.toBase58();
+        if (from === watchBase58) {
+          lamportsOut += tr.lamports;
+          transfersOut.push({ to, lamports: tr.lamports });
+        }
       }
     } catch {}
   }
@@ -249,7 +284,6 @@ function decodeSystemTransfersOutWithSum(tx, watchBase58) {
   return { lamportsOut, transfersOut };
 }
 
-// Fallback: net delta (includes fee), only used when cannot decode transfers out
 function getNetOutLamportsFallback(tx, watchBase58) {
   const meta = tx?.meta;
   if (!meta) return 0;
@@ -262,9 +296,8 @@ function getNetOutLamportsFallback(tx, watchBase58) {
   const post = meta.postBalances?.[idx];
   if (typeof pre !== "number" || typeof post !== "number") return 0;
 
-  const delta = post - pre; // negative if out
+  const delta = post - pre;
   if (delta >= 0) return 0;
-
   return -delta;
 }
 
@@ -299,9 +332,11 @@ async function main() {
   const watchPk = new PublicKey(WATCH_ADDRESS);
   const watch = watchPk.toBase58();
 
-  console.log("✅ Outflow watcher (5-digits = 4dp CUT, count digits incl leading 0 for <1)");
+  console.log("✅ Outflow watcher (notify matched dest wallets fixed)");
   console.log("WATCH:", watch);
-  console.log(`Config: window=${WINDOW_OUTFLOWS}, required=${REQUIRED_MATCH}, range=[${MIN_SOL}, ${MAX_SOL}] SOL, poll=${POLL_SECONDS}s`);
+  console.log(
+    `Config: window=${WINDOW_OUTFLOWS}, required=${REQUIRED_MATCH}, range=[${MIN_SOL}, ${MAX_SOL}] SOL, poll=${POLL_SECONDS}s`
+  );
 
   // Warm-up once
   if (!state.anchorSig) {
@@ -324,7 +359,7 @@ async function main() {
       if (newSigs.length > 0) {
         state.anchorSig = newSigs[0];
 
-        const ordered = [...newSigs].reverse(); // older -> newer
+        const ordered = [...newSigs].reverse();
         for (const sig of ordered) {
           const tx = await conn.getTransaction(sig, {
             commitment: "confirmed",
@@ -335,18 +370,16 @@ async function main() {
           const { lamportsOut } = decodeSystemTransfersOutWithSum(tx, watch);
           let outLamports = lamportsOut;
 
-          // fallback when can't decode
+          // fallback when can't decode (still outflow but no dest info)
           if (!outLamports || outLamports <= 0) {
             outLamports = getNetOutLamportsFallback(tx, watch);
           }
-          if (!outLamports || outLamports <= 0) continue; // not outflow
-
-          const sol4 = lamportsToSol4String(outLamports);
+          if (!outLamports || outLamports <= 0) continue;
 
           state.outflows.unshift({
             signature: sig,
-            outLamports: outLamports,
-            outflowSol4: sol4,
+            outLamports,
+            outflowSol4: lamportsToSol4String(outLamports),
             ts: Date.now(),
           });
           addedOutflows++;
@@ -366,13 +399,15 @@ async function main() {
 
       // Evaluate
       if (state.outflows.length >= WINDOW_OUTFLOWS) {
-        const considered = state.outflows.filter((x) => inSolRange(x.outLamports));
+        const considered = state.outflows.filter((x) => inSolRangeLamports(x.outLamports));
         const matches = considered.filter((x) => isFiveDigitsLamports_4dpCut(x.outLamports));
 
         const inRangeCount = considered.length;
         const fiveDigitsCount = matches.length;
 
-        console.log(`🧾 OutflowsWindow=${state.outflows.length} | InRange=${inRangeCount} | FiveDigits=${fiveDigitsCount}`);
+        console.log(
+          `🧾 OutflowsWindow=${state.outflows.length} | InRange=${inRangeCount} | FiveDigits=${fiveDigitsCount}`
+        );
 
         if (fiveDigitsCount >= REQUIRED_MATCH) {
           const alertKey = makeAlertKey(state.outflows);
@@ -380,21 +415,39 @@ async function main() {
             state.lastAlertKey = alertKey;
             saveState();
 
-            // Build matchedLines: show DEST wallets from transfers in matched tx
+            // ✅ Build matched destination wallets (FIXED):
+            // Prefer parsed tx for reliable destination extraction
             const matchedLines = [];
             const destSet = new Set();
 
             for (const m of matches) {
-              const tx = await conn.getTransaction(m.signature, {
-                commitment: "confirmed",
-                maxSupportedTransactionVersion: 0,
-              });
+              let transfers = [];
 
-              const { transfersOut } = decodeSystemTransfersOutWithSum(tx, watch);
+              // 1) try parsed
+              try {
+                const ptx = await conn.getParsedTransaction(m.signature, {
+                  commitment: "confirmed",
+                  maxSupportedTransactionVersion: 0,
+                });
+                if (ptx) transfers = extractTransfersFromParsed(ptx, watch);
+              } catch {}
 
-              // For each transfer out: apply SAME rule on that transfer amount (range + 5digits)
-              for (const t of transfersOut) {
-                if (!inSolRange(t.lamports)) continue;
+              // 2) fallback compiled
+              if (!transfers || transfers.length === 0) {
+                try {
+                  const tx = await conn.getTransaction(m.signature, {
+                    commitment: "confirmed",
+                    maxSupportedTransactionVersion: 0,
+                  });
+                  const d = decodeSystemTransfersOutWithSum(tx, watch);
+                  transfers = d.transfersOut || [];
+                } catch {}
+              }
+
+              // Apply SAME rule to each transfer amount for "matched wallets"
+              for (const t of transfers) {
+                if (!t?.to || !t?.lamports) continue;
+                if (!inSolRangeLamports(t.lamports)) continue;
                 if (!isFiveDigitsLamports_4dpCut(t.lamports)) continue;
 
                 const sol4 = lamportsToSol4String(t.lamports);
@@ -414,7 +467,7 @@ async function main() {
                 inRangeCount,
                 fiveDigitsCount,
               });
-              console.log("✅ Sent Discord notify.");
+              console.log("✅ Sent Discord notify (with matched wallets).");
             } catch (e) {
               console.error("❌ Discord webhook failed:", e?.message || e);
             }
@@ -431,7 +484,9 @@ async function main() {
           }
         }
       } else {
-        console.log(`⏳ Waiting outflows: ${state.outflows.length}/${WINDOW_OUTFLOWS} (new sigs=${newSigs.length})`);
+        console.log(
+          `⏳ Waiting outflows: ${state.outflows.length}/${WINDOW_OUTFLOWS} (new sigs=${newSigs.length})`
+        );
       }
     } catch (e) {
       console.error("❌ Loop error:", e?.message || e);
