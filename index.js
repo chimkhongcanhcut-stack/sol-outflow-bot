@@ -64,53 +64,54 @@ function solscanTxUrl(sig) {
   return `https://solscan.io/tx/${sig}`;
 }
 
+function makeAlertKey(outflowSigs) {
+  return outflowSigs.map((x) => x.signature).join("|");
+}
+
 function inSolRangeLamports(lamports) {
   const sol = Math.abs(lamports) / LAMPORTS_PER_SOL;
   return sol >= MIN_SOL && sol <= MAX_SOL;
 }
 
-function makeAlertKey(outflowSigs) {
-  return outflowSigs.map((x) => x.signature).join("|");
+// ================== SOL FORMAT (NO PAD, NO EXTRA 0) ==================
+// Convert lamports -> SOL string with up to 9 decimals, TRIM trailing zeros, NEVER pad extra zeros.
+function lamportsToSolStringTrim(lamports) {
+  const v = BigInt(lamports < 0 ? -lamports : lamports);
+  const base = 1000000000n;
+
+  const intPart = v / base;
+  let frac = (v % base).toString().padStart(9, "0"); // internal only
+  frac = frac.replace(/0+$/, ""); // trim trailing zeros
+
+  if (!frac) return intPart.toString();
+  return `${intPart.toString()}.${frac}`;
 }
 
-// ================== EXACT BALANCE RULE (pre=0, post=x.xxxx, 5digits) ==================
-const LAMPORTS_PER_SOL_4DP = 100000; // 1e9 / 1e4 = 1e5
-
-function lamportsToSol4ExactString(lamports) {
-  const v = Math.abs(Number(lamports || 0));
-  if (!Number.isFinite(v) || v < 0) return null;
-  if (v % LAMPORTS_PER_SOL_4DP !== 0) return null; // must be exact 4dp
-  const scaled = v / LAMPORTS_PER_SOL_4DP; // integer = SOL*10000
-  const intPart = Math.floor(scaled / 10000);
-  const fracPart = scaled % 10000;
-  return `${intPart}.${String(fracPart).padStart(4, "0")}`;
+// digits = remove dot from trimmed string, count length (includes leading "0" before dot)
+function digitsCountFromSolString(solStr) {
+  return solStr.replace(".", "").length;
 }
 
-// TRUE only if post is exact x.xxxx AND digits(postString without dot) == 5 (<=99999)
-function isFiveDigitsByPostBalanceLamports(postLamports) {
-  const v = Math.abs(Number(postLamports || 0));
-  if (!Number.isFinite(v) || v <= 0) return false;
-  if (v % LAMPORTS_PER_SOL_4DP !== 0) return false; // must be x.xxxx exactly
-  const scaled = v / LAMPORTS_PER_SOL_4DP; // SOL*10000 exact integer
+// MATCH rule for "5 digits" with NO auto-adding zeros:
+// - Use trimmed SOL string (no trailing zeros)
+// - Remove dot and count digits must be exactly 5
+function isFiveDigitsPostBalanceLamports(postLamports) {
+  const abs = Math.abs(Number(postLamports || 0));
+  if (!Number.isFinite(abs) || abs <= 0) return false;
 
-  // 1.7824 => 17824 ✅
-  // 0.1234 => 1234  => treat as "01234" ✅
-  // 10.0000 => 100000 ❌
-  return scaled >= 0 && scaled <= 99999;
+  const solStr = lamportsToSolStringTrim(abs);
+  const digits = digitsCountFromSolString(solStr);
+  return digits === 5;
 }
 
-// ================== DISCORD NOTIFY (GỌN + ĐẸP) ==================
-async function sendDiscordText({
-  watch,
-  matchedLines, // [{sol4, destWallet, sig}]
-  windowSize,
-  fiveDigitsCount,
-}) {
-  const top = matchedLines.slice(0, PREVIEW_DEST_LIMIT);
+// ================== DISCORD NOTIFY (GỌN + ĐẸP, KHÔNG PAD) ==================
+async function sendDiscordText({ watch, matches, windowSize, matchedCount }) {
+  // matches: [{postSolStr, destWallet, sig}]
+  const top = matches.slice(0, PREVIEW_DEST_LIMIT);
 
-  const header = `🚨 **OUTFLOW PATTERN HIT**  •  **${fiveDigitsCount}/${REQUIRED_MATCH}** matched`;
+  const header = `🚨 **OUTFLOW HIT** • **${matchedCount}/${REQUIRED_MATCH}** matched`;
   const watchLine = `👀 **Watch:** \`${watch}\`\n🔗 ${solscanAccountUrl(watch)}`;
-  const rangeLine = `🎯 **Rule:** dest **pre=0** & dest **post=x.xxxx** (5 digits)  •  Range **${MIN_SOL} → ${MAX_SOL} SOL**  •  Window **${windowSize}**`;
+  const ruleLine = `✅ **Rule:** dest pre=0 & post has **exactly 5 digits** (no padding) • Range **${MIN_SOL}→${MAX_SOL} SOL** • Window **${windowSize}**`;
 
   const list =
     top.length === 0
@@ -119,13 +120,11 @@ async function sendDiscordText({
         top
           .map(
             (x, i) =>
-              `**${i + 1}.** \`${x.sol4}\` → \`${x.destWallet}\`\n   ↳ ${solscanTxUrl(x.sig)}`
+              `**${i + 1}.** \`${x.postSolStr}\` → \`${x.destWallet}\`\n   ↳ ${solscanTxUrl(x.sig)}`
           )
           .join("\n");
 
-  const content =
-    (DISCORD_PING ? `${DISCORD_PING}\n` : "") +
-    [header, watchLine, rangeLine, list].join("\n\n");
+  const content = (DISCORD_PING ? `${DISCORD_PING}\n` : "") + [header, watchLine, ruleLine, list].join("\n\n");
 
   await axios.post(
     DISCORD_WEBHOOK_URL,
@@ -330,7 +329,7 @@ async function main() {
   const watchPk = new PublicKey(WATCH_ADDRESS);
   const watch = watchPk.toBase58();
 
-  console.log("✅ SOL Outflow watcher (MATCH: dest pre=0 & dest post=x.xxxx 5digits)");
+  console.log("✅ SOL Outflow watcher (MATCH: dest pre=0 & post digits=5, NO padding zeros)");
   console.log("WATCH:", watch);
   console.log(
     `Config: window=${WINDOW_OUTFLOWS}, required=${REQUIRED_MATCH}, range=[${MIN_SOL}, ${MAX_SOL}] SOL, poll=${POLL_SECONDS}s`
@@ -375,8 +374,7 @@ async function main() {
       }
 
       if (state.outflows.length >= WINDOW_OUTFLOWS) {
-        const matchedLines = [];
-        const matchedTxSigs = [];
+        const matches = [];
 
         for (const item of state.outflows) {
           const sig = item.signature;
@@ -410,8 +408,7 @@ async function main() {
             } catch {}
           }
 
-          let txMatched = false;
-
+          // 1 tx counts max 1 match
           for (const t of transfers || []) {
             if (!t?.to) continue;
 
@@ -420,33 +417,25 @@ async function main() {
 
             const { pre, post } = pp;
 
-            // ✅ RULE 1: preBalance must be 0
+            // ✅ preBalance must be 0 (brand new wallet)
             if (pre !== 0) continue;
 
-            // ✅ post must be exact x.xxxx AND 5digits
-            if (!isFiveDigitsByPostBalanceLamports(post)) continue;
-
-            // ✅ optional: range filter based on "post" (since pre=0)
+            // ✅ range based on post (since pre=0)
             if (!inSolRangeLamports(post)) continue;
 
-            const sol4 = lamportsToSol4ExactString(post);
-            if (!sol4) continue;
+            // ✅ digits=5 based on POST balance string (trimmed, NO extra zeros)
+            if (!isFiveDigitsPostBalanceLamports(post)) continue;
 
-            matchedLines.push({ sol4, destWallet: t.to, sig });
-            matchedTxSigs.push(sig);
-            txMatched = true;
-            break; // 1 tx counts max 1 match
+            const postSolStr = lamportsToSolStringTrim(post);
+            matches.push({ postSolStr, destWallet: t.to, sig });
+            break;
           }
-
-          // no-op (txMatched only used for clarity)
-          void txMatched;
         }
 
-        const fiveDigitsCount = matchedTxSigs.length;
+        const matchedCount = matches.length;
+        console.log(`🧾 Window=${state.outflows.length} | Matched=${matchedCount}/${REQUIRED_MATCH}`);
 
-        console.log(`🧾 Window=${state.outflows.length} | Matched=${fiveDigitsCount}/${REQUIRED_MATCH}`);
-
-        if (fiveDigitsCount >= REQUIRED_MATCH) {
+        if (matchedCount >= REQUIRED_MATCH) {
           const alertKey = makeAlertKey(state.outflows);
 
           if (state.lastAlertKey !== alertKey) {
@@ -456,9 +445,9 @@ async function main() {
             try {
               await sendDiscordText({
                 watch,
-                matchedLines,
+                matches,
                 windowSize: state.outflows.length,
-                fiveDigitsCount,
+                matchedCount,
               });
               console.log("✅ Sent Discord notify.");
             } catch (e) {
